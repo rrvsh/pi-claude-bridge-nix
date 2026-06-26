@@ -1,0 +1,8 @@
+{
+  "version": "1.5.0",
+  "rev": "d70c86ff9302ddecb7e2ae9d833bacb0544d6ecd",
+  "srcHash": "sha256-VmGea5gTfD3KgkX6/nongGVcRwM96uSmLKq0RxeL0zY=",
+  "npmDepsHash": "sha256-Mcr6n1SgVoN+XiI+sArROnUmkGN9soaWtPRFCA4LjY4=",
+  "sourceRoot": "pi-extensions/pi-claude-bridge",
+  "lockfileSource": "upstream subdirectory package-lock.json"
+}

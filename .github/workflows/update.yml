@@ -1,0 +1,104 @@
+name: Update pi-claude-bridge package
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "31 3 * * *"
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  update:
+    name: Update pi-claude-bridge package
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      BRANCH_NAME: chore/update-pi-claude-bridge
+    steps:
+      - name: Checkout repository
+        timeout-minutes: 5
+        uses: actions/checkout@v6
+
+      - name: Install Nix
+        timeout-minutes: 10
+        uses: cachix/install-nix-action@v31
+        with:
+          extra_nix_config: |
+            access-tokens = github.com=${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure rrvsh Cachix
+        timeout-minutes: 10
+        uses: cachix/cachix-action@v17
+        with:
+          name: rrvsh
+          skipPush: true
+
+      - name: Run updater
+        timeout-minutes: 120
+        run: nix run .#update
+
+      - name: Check for changes
+        id: changes
+        timeout-minutes: 5
+        run: |
+          if git diff --quiet -- flake.lock VERSION.json; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "No changes in flake.lock or VERSION.json."
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "Changes detected in flake.lock or VERSION.json."
+          fi
+
+      - name: Create update branch and commit
+        if: steps.changes.outputs.changed == 'true'
+        timeout-minutes: 10
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git switch -c "$BRANCH_NAME"
+          git add flake.lock VERSION.json
+          git commit -m "chore(update): refresh pi claude bridge package"
+          git fetch origin "refs/heads/$BRANCH_NAME:refs/remotes/origin/$BRANCH_NAME" || true
+          git push --force-with-lease origin "$BRANCH_NAME"
+
+      - name: Create or reuse pull request
+        if: steps.changes.outputs.changed == 'true'
+        id: pr
+        timeout-minutes: 5
+        run: |
+          PR_NUMBER=$(gh pr list \
+            --state open \
+            --base main \
+            --head "$BRANCH_NAME" \
+            --json number \
+            --jq '.[0].number // empty')
+
+          if [ -z "$PR_NUMBER" ]; then
+            gh pr create \
+              --title "chore(update): refresh pi claude bridge package" \
+              --body "Automated update of pi-claude-bridge package version and flake.lock." \
+              --base main \
+              --head "$BRANCH_NAME"
+            PR_NUMBER=$(gh pr list \
+              --state open \
+              --base main \
+              --head "$BRANCH_NAME" \
+              --json number \
+              --jq '.[0].number')
+          else
+            echo "Open pull request #$PR_NUMBER already exists for $BRANCH_NAME."
+          fi
+
+          echo "number=$PR_NUMBER" >> "$GITHUB_OUTPUT"
+
+      - name: Enable auto-merge
+        if: steps.changes.outputs.changed == 'true'
+        timeout-minutes: 5
+        run: |
+          gh pr merge \
+            --auto \
+            --delete-branch \
+            --squash \
+            "${{ steps.pr.outputs.number }}"

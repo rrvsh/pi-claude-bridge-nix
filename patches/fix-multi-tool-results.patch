@@ -1,0 +1,35 @@
+diff --git a/tests/unit-import.mjs b/tests/unit-import.mjs
+index 22756ad..5d6c111 100644
+--- a/tests/unit-import.mjs
++++ b/tests/unit-import.mjs
+@@ -250,6 +250,30 @@ describe("message structure", () => {
+ 		assert.deepEqual(findUnpairedToolUses(result), []);
+ 	});
+ 
++	it("interleaved Pi user text is held until all parallel tool results are adjacent", () => {
++		const msgs = [
++			{ role: "user", content: "run both tools" },
++			{ role: "assistant", content: [
++				{ type: "text", text: "I will call both tools." },
++				{ type: "toolCall", id: "call:one", name: "read", arguments: { path: "one.txt" } },
++				{ type: "toolCall", id: "call:two", name: "bash", arguments: { command: "pwd" } },
++			] },
++			{ role: "toolResult", toolCallId: "call:one", content: "one" },
++			{ role: "user", content: "Pi follow-up between results" },
++			{ role: "toolResult", toolCallId: "call:two", content: "two" },
++			{ role: "assistant", content: [{ type: "text", text: "done" }] },
++		];
++
++		const result = convert(msgs);
++		assert.equal(result.length, 5);
++		assert.equal(result[1].role, "assistant");
++		assert.deepEqual(result[2].content.map((block) => block.tool_use_id), ["call_one", "call_two"]);
++		assert.equal(result[3].role, "user");
++		assert.equal(result[3].content, "Pi follow-up between results");
++		assert.equal(result[4].role, "assistant");
++		assert.deepEqual(findUnpairedToolUses(result), []);
++	});
++
+ 	it("mixed conversation: user → assistant(tool) → toolResult → assistant(text)", () => {
+ 		const msgs = [
+ 			{ role: "user", content: "read file.txt" },

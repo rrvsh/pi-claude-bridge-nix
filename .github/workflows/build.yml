@@ -42,6 +42,10 @@ jobs:
           name: rrvsh
           authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
 
-      - name: Build pi-claude-bridge
+      # Push both the npm-deps fixed-output derivation and the final package so
+      # restricted downstream hosts can substitute instead of contacting npm.
+      - name: Build pi-claude-bridge and npm deps
         timeout-minutes: 120
-        run: nix build --print-build-logs ".#packages.${{ matrix.system }}.pi-claude-bridge"
+        run: |
+          nix build --print-build-logs ".#packages.${{ matrix.system }}.pi-claude-bridge.npmDeps"
+          nix build --print-build-logs ".#packages.${{ matrix.system }}.pi-claude-bridge"

@@ -33,7 +33,7 @@ jobs:
         uses: cachix/cachix-action@v17
         with:
           name: rrvsh
-          skipPush: true
+          authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
 
       - name: Run updater
         timeout-minutes: 120

@@ -69,7 +69,7 @@ nix build --print-build-logs .#packages.aarch64-darwin.pi-claude-bridge  # on Da
 git diff --check
 ```
 
-CI runs equivalent per-system builds on push and pull requests ([build workflow](./.github/workflows/build.yml#L12-L47)).
+CI runs equivalent per-system builds on push and pull requests ([build workflow](./.github/workflows/build.yml#L12-L50)). The build workflow authenticates to the `rrvsh` Cachix cache with `CACHIX_AUTH_TOKEN` and explicitly builds both `pi-claude-bridge.npmDeps` and `pi-claude-bridge` for `x86_64-linux` and `aarch64-darwin`. This publishes the fixed-output npm dependency tree and final package so downstream hosts in restricted npm environments can substitute from Cachix instead of contacting `registry.npmjs.org` during evaluation/build.
 
 ## Carried runtime patch: root cause and fix
 

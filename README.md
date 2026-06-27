@@ -103,7 +103,7 @@ The carried patch wires the active-query result path in `src/index.ts` through a
 6. skips already resolved duplicates instead of re-queuing them and creating simultaneous pending/queued state ([duplicate guard](./patches/fix-multi-tool-results.patch#L158-L162));
 7. resolves each pending handler, marks delivered/resolved progress, or queues known early results using the existing query context maps ([delivery loop](./patches/fix-multi-tool-results.patch#L163-L176)).
 
-The runtime effect is that the case proven by the investigation can now complete in the active turn: if Pi history contains both tool results for a two-tool assistant turn, but tail extraction saw only one, `deliverToolResults()` supplements the missing known result from history and resolves both pending handlers. True missing results remain visible: `missingFromContextIds` stays non-empty, teardown mismatch behavior remains in place, and the bridge still rebuilds/rotates rather than pretending success.
+The intended runtime effect is that the likely failure mode identified by the investigation can complete in the active turn: if Pi history contains both tool results for a two-tool assistant turn, but tail extraction saw only one, `deliverToolResults()` supplements the missing known result from history and resolves both pending handlers. The new patched source file is `src/tool-result-delivery.ts` (visible in [`patches/fix-multi-tool-results.patch`](./patches/fix-multi-tool-results.patch#L51-L177)). True missing results remain visible: `missingFromContextIds` stays non-empty, teardown mismatch behavior remains in place, and the bridge still rebuilds/rotates rather than pretending success.
 
 ### Tests carried with the patch
 
@@ -118,7 +118,7 @@ Proven by repository files and validation:
 
 - The flake pins upstream source/version/hashes in [`VERSION.json`](./VERSION.json#L1-L8).
 - The package builds from source with Node 22, applies the runtime patch, runs typecheck and focused tests, and validates Pi extension metadata ([package derivation](./nix/pi-claude-bridge.nix#L14-L63)).
-- The patch changes active-query delivery, not just conversion tests ([active call site](./patches/fix-multi-tool-results.patch#L12-L50), [helper](./patches/fix-multi-tool-results.patch#L129-L177)).
+- The patch changes active-query delivery, not just conversion tests ([active call site](./patches/fix-multi-tool-results.patch#L12-L50), [`tool-result-delivery` helper](./patches/fix-multi-tool-results.patch#L51-L177)).
 - Downstream `tools` can consume the package as a local Pi package path from `bridge.passthru.packagePath` ([tools integration branch](https://github.com/rrvsh/tools/blob/pi-claude-bridge-nix-integration/nix/modules/claude-code.nix#L6-L15)).
 
 Remaining runtime-validation risks:

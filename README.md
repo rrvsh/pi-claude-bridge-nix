@@ -77,7 +77,7 @@ CI runs equivalent per-system builds on push and pull requests ([build workflow]
 
 Runtime investigation on host `auto` found repeated bridge diagnostics of the form `tool_result_delivery_mismatch` with `expectedCount: 2`, `deliveredCount: 1`, `resolvedCount: 1`, and `waitingCount: 1`. Follow-up diagnostics reported `repair_tool_pairing_synthetic_results`, and the shared Claude session was marked `needsRebuild: true` / `forceRotate: true`. In user-visible sessions this correlated with the manual "keep going" symptom: a new user turn was often needed before productive continuation resumed.
 
-Those observations are facts from the local auto-log investigation, not claims from upstream. The inferred root cause is narrower: during an active Claude query with parallel tool calls, Pi history could contain more than one `toolResult`, but the bridge's active-query callback delivered only the tail-extracted subset to the waiting Claude MCP handlers. One handler resolved, another remained pending, teardown saw `expectedCount > deliveredCount`, and the bridge correctly treated the Claude transcript as unsafe to resume.
+Those observations are facts from the local auto-log investigation, not claims from upstream. Follow-up diagnostics found two concrete bridge-side failure modes. First, during an active Claude query with parallel tool calls, Pi history could contain more than one `toolResult`, but the bridge's active-query callback delivered only the tail-extracted subset to the waiting Claude MCP handlers. Second, Claude Code could emit another MCP `tool_use` while the Pi stream was already closed for a prior tool-use boundary; the bridge recorded and claimed that id, but did not surface the new tool call back to Pi on the next result-delivery stream. In both cases, one handler resolved, another remained pending, teardown saw `expectedCount > deliveredCount`, and the bridge correctly treated the Claude transcript as unsafe to resume.
 
 ### Why synthetic repairs and rebuild/rotation were symptoms, not the primary fix
 
@@ -93,24 +93,26 @@ However, conversion is not the same as active-query delivery. The live bridge al
 
 ### What this runtime patch changes
 
-The carried patch wires the active-query result path in `src/index.ts` through a new helper, `deliverToolResults()` ([patch import and call site](./patches/fix-multi-tool-results.patch#L4-L50)). Instead of trusting only the tail extraction, the helper:
+The carried patch wires the active-query result path in `src/index.ts` through a new helper, `deliverToolResults()`. Instead of trusting only the tail extraction, the helper:
 
-1. records which ids were extracted from the active tail, which `toolResult` ids exist in full Pi message history, and which recorded tool calls still have waiting handlers ([diagnostic structure](./patches/fix-multi-tool-results.patch#L68-L81));
-2. scans the full Pi context for `role: "toolResult"` messages and converts their content to MCP results ([context scan](./patches/fix-multi-tool-results.patch#L94-L105));
-3. computes `presentButNotExtractedIds` and `missingFromContextIds` so the logs distinguish "Pi has the result but tail extraction missed it" from "Pi never recorded the result" ([diagnosis](./patches/fix-multi-tool-results.patch#L107-L127));
-4. supplements delivery with context results whose `toolCallId` matches a recorded Claude tool call and is not already represented in the extracted set ([supplement path](./patches/fix-multi-tool-results.patch#L129-L147));
-5. refuses unknown result ids exactly as before, so a result for an unregistered tool call cannot be misdelivered to another pending handler ([unknown-id guard](./patches/fix-multi-tool-results.patch#L149-L157));
-6. skips already resolved duplicates instead of re-queuing them and creating simultaneous pending/queued state ([duplicate guard](./patches/fix-multi-tool-results.patch#L158-L162));
-7. resolves each pending handler, marks delivered/resolved progress, or queues known early results using the existing query context maps ([delivery loop](./patches/fix-multi-tool-results.patch#L163-L176)).
+1. records which ids were extracted from the active tail, which `toolResult` ids exist in full Pi message history, and which recorded tool calls still have waiting handlers;
+2. scans the full Pi context for `role: "toolResult"` messages and converts their content to MCP results;
+3. computes `presentButNotExtractedIds` and `missingFromContextIds` so the logs distinguish "Pi has the result but tail extraction missed it" from "Pi never recorded the result";
+4. supplements delivery with context results whose `toolCallId` matches a recorded Claude tool call and is not already represented in the extracted set;
+5. refuses unknown result ids exactly as before, so a result for an unregistered tool call cannot be misdelivered to another pending handler;
+6. skips already resolved duplicates instead of re-queuing them and creating simultaneous pending/queued state;
+7. resolves each pending handler, marks delivered/resolved progress, or queues known early results using the existing query context maps.
 
-The intended runtime effect is that the likely failure mode identified by the investigation can complete in the active turn: if Pi history contains both tool results for a two-tool assistant turn, but tail extraction saw only one, `deliverToolResults()` supplements the missing known result from history and resolves both pending handlers. The new patched source file is `src/tool-result-delivery.ts` (visible in [`patches/fix-multi-tool-results.patch`](./patches/fix-multi-tool-results.patch#L51-L177)). True missing results remain visible: `missingFromContextIds` stays non-empty, teardown mismatch behavior remains in place, and the bridge still rebuilds/rotates rather than pretending success.
+The patch also changes the timeout and tool-call surfacing behavior for the later `auto` failure mode: the stream-idle watchdog no longer fires while MCP handlers are pending, and assistant `tool_use` blocks observed while no Pi stream is open are tracked as undelivered and flushed to Pi when the next active result-delivery stream is available. The intended runtime effect is that known waiting tools are either surfaced to Pi or resolved from real Pi results instead of being killed by a 90-second Claude-idle retry. True missing results remain visible: `missingFromContextIds` stays non-empty, teardown mismatch behavior remains in place, and the bridge still rebuilds/rotates rather than pretending success.
 
 ### Tests carried with the patch
 
-The patch adds two kinds of regression coverage and the Nix build runs both ([check command list](./nix/pi-claude-bridge.nix#L36-L43)):
+The patch adds regression coverage and the Nix build runs the focused suites ([check command list](./nix/pi-claude-bridge.nix#L36-L45)):
 
-- A conversion test proves interleaved Pi user text is replayed after grouped parallel tool results, preserving Anthropic history ordering ([test patch](./patches/fix-multi-tool-results.patch#L185-L207)).
-- Active delivery tests prove a waiting result present in Pi history but absent from tail extraction is supplemented and resolved, duplicate resolved results are skipped, and unknown ids are rejected ([test file patch](./patches/fix-multi-tool-results.patch#L212-L260)).
+- A conversion test proves interleaved Pi user text is replayed after grouped parallel tool results, preserving Anthropic history ordering.
+- Query-context tests cover tracking assistant tool calls that were recorded while no Pi stream was available.
+- Stream-idle tests prove the watchdog still fires for genuine pre-output idle, but does not fire while MCP tool handlers are pending.
+- Active delivery tests prove a waiting result present in Pi history but absent from tail extraction is supplemented and resolved, duplicate resolved results are skipped, and unknown ids are rejected.
 
 ## Proven facts vs remaining risks
 
@@ -123,7 +125,7 @@ Proven by repository files and validation:
 
 Remaining runtime-validation risks:
 
-- The exact `auto` failure shape was inferred from diagnostics and local tests; a live long-running Pi/Claude Code reproduction after rebuild is still the strongest validation.
+- The `auto` failure shapes were inferred from diagnostics and local tests; a live long-running Pi/Claude Code reproduction after rebuild is still the strongest validation.
 - The helper scans full current Pi context for recorded ids. It refuses unknown ids and skips already resolved duplicates, but a future Pi history-shape change could require adjusting the context scan.
 - Upstream updates may move or rewrite the active-query delivery code, so `nix run .#update` must be followed by a build and review of patch applicability.
 

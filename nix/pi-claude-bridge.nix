@@ -38,6 +38,8 @@ in
           runHook preCheck
           npm run typecheck
           node --import tsx --test tests/unit-import.mjs
+          node --import tsx --test tests/unit-querycontext.mjs
+          node --import tsx --test tests/unit-rate-limit.mjs
           node --import tsx --test tests/unit-tool-result-delivery.mjs
           runHook postCheck
         '';

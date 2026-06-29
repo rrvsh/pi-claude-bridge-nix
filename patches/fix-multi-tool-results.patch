@@ -1,6 +1,6 @@
 diff -ruN '--exclude=node_modules' orig/src/index.ts patched/src/index.ts
 --- orig/src/index.ts	2026-06-29 09:53:34.059382020 +0800
-+++ patched/src/index.ts	2026-06-29 09:58:58.619409482 +0800
++++ patched/src/index.ts	2026-06-29 10:16:32.683603183 +0800
 @@ -15,6 +15,7 @@
  import { MCP_SERVER_NAME, MCP_TOOL_PREFIX, extractSkillsBlock } from "./skills.js";
  import { verifyWrittenSession as _verifyWrittenSession } from "./session-verify.js";
@@ -13,7 +13,7 @@ diff -ruN '--exclude=node_modules' orig/src/index.ts patched/src/index.ts
  	turnOutput: AssistantMessage | null;
  	turnSawStreamEvent: boolean;
  	turnStarted: boolean;
-+  pendingToolCallCount?: number;
++	pendingToolCallCount?: number;
  }
  
  export interface StreamIdleTimeoutInfo {
@@ -22,69 +22,80 @@ diff -ruN '--exclude=node_modules' orig/src/index.ts patched/src/index.ts
  		&& state.turnOutput
  		&& !state.turnStarted
 -		&& !state.turnSawStreamEvent,
-+    && !state.turnSawStreamEvent
-+    && (state.pendingToolCallCount ?? 0) === 0,
++		&& !state.turnSawStreamEvent
++		&& (state.pendingToolCallCount ?? 0) === 0,
  	);
  
  	const schedule = () => {
-@@ -1547,15 +1550,21 @@
+@@ -1305,6 +1308,7 @@
+ 						resolve(result);
+ 					},
+ 				});
++				flushUndeliveredToolCalls(queryCtx);
+ 			});
+ 		},
+ 	}));
+@@ -1547,15 +1551,21 @@
  	customToolNameToPi: Map<string, string>,
  ): boolean {
  	const c = ctx();
-+  const canEmitToPi = Boolean(c.currentPiStream && c.turnOutput);
++	const canEmitToPi = Boolean(c.currentPiStream && c.turnOutput);
  	if (!assistantMsg?.content) return false;
  	let sawToolUse = false;
  	for (const block of assistantMsg.content) {
  		if (block.type !== "tool_use") continue;
  		sawToolUse = true;
 -		const existingIdx = c.turnBlocks.findIndex((b: any) => b.type === "toolCall" && b.id === block.id);
-+    const existingIdx = canEmitToPi ? c.turnBlocks.findIndex((b: any) => b.type === "toolCall" && b.id === block.id) : -1;
++		const existingIdx = canEmitToPi ? c.turnBlocks.findIndex((b: any) => b.type === "toolCall" && b.id === block.id) : -1;
  		const name = mapToolName(block.name, customToolNameToPi);
  		const mappedArgs = mapToolArgs(name, block.input);
  		c.recordToolCall(block.id, name, mappedArgs);
-+    if (!canEmitToPi) {
-+      c.markToolCallUndelivered(block.id);
-+      debug(`processAssistantMessage boundary: queued tool_use [${block.id}] for later Pi delivery`);
-+      continue;
-+    }
++		if (!canEmitToPi) {
++			c.markToolCallUndelivered(block.id);
++			debug(`processAssistantMessage boundary: queued tool_use [${block.id}] for later Pi delivery`);
++			continue;
++		}
  		if (existingIdx >= 0) {
  			const existing = c.turnBlocks[existingIdx] as any;
  			existing.name = name;
-@@ -1584,6 +1593,33 @@
+@@ -1584,6 +1594,36 @@
  	return sawToolUse;
  }
  
 +function flushUndeliveredToolCalls(queryCtx: QueryContext): boolean {
-+  if (!queryCtx.currentPiStream || !queryCtx.turnOutput) return false;
-+  const waitingIds = [...queryCtx.pendingToolCalls.keys()];
-+  const toolCalls = queryCtx.takeUndeliveredToolCalls(waitingIds);
-+  if (toolCalls.length === 0) return false;
-+  debug(`provider: flushing ${toolCalls.length} deferred tool calls to Pi [${toolCalls.map((call) => call.id).join(",")}]`);
-+  for (const call of toolCalls) {
-+    ensureTurnStarted();
-+    queryCtx.turnSawToolCall = true;
-+    queryCtx.turnBlocks.push({
-+      type: "toolCall",
-+      id: call.id,
-+      name: call.toolName,
-+      arguments: call.arguments,
-+    });
-+    const idx = queryCtx.turnBlocks.length - 1;
-+    const toolBlock = queryCtx.turnBlocks[idx];
-+    queryCtx.currentPiStream.push({ type: "toolcall_start", contentIndex: idx, partial: queryCtx.turnOutput });
-+    queryCtx.currentPiStream.push({ type: "toolcall_end", contentIndex: idx, toolCall: toolBlock as any, partial: queryCtx.turnOutput });
-+  }
-+  queryCtx.turnOutput.stopReason = "toolUse";
-+  queryCtx.currentPiStream.push({ type: "done", reason: "toolUse", message: queryCtx.turnOutput });
-+  queryCtx.currentPiStream.end();
-+  queryCtx.currentPiStream = null;
-+  return true;
++	if (!queryCtx.currentPiStream || !queryCtx.turnOutput) return false;
++	const waitingIds = [...queryCtx.pendingToolCalls.keys()];
++	const toolCalls = queryCtx.takeUndeliveredToolCalls(waitingIds);
++	if (toolCalls.length === 0) return false;
++	debug(`provider: flushing ${toolCalls.length} deferred tool calls to Pi [${toolCalls.map((call) => call.id).join(",")}]`);
++	for (const call of toolCalls) {
++		if (!queryCtx.turnStarted) {
++			queryCtx.currentPiStream.push({ type: "start", partial: queryCtx.turnOutput });
++			queryCtx.turnStarted = true;
++		}
++		queryCtx.turnSawToolCall = true;
++		queryCtx.turnBlocks.push({
++			type: "toolCall",
++			id: call.id,
++			name: call.toolName,
++			arguments: call.arguments,
++		});
++		const idx = queryCtx.turnBlocks.length - 1;
++		const toolBlock = queryCtx.turnBlocks[idx];
++		queryCtx.currentPiStream.push({ type: "toolcall_start", contentIndex: idx, partial: queryCtx.turnOutput });
++		queryCtx.currentPiStream.push({ type: "toolcall_end", contentIndex: idx, toolCall: toolBlock as any, partial: queryCtx.turnOutput });
++	}
++	queryCtx.turnOutput.stopReason = "toolUse";
++	queryCtx.currentPiStream.push({ type: "done", reason: "toolUse", message: queryCtx.turnOutput });
++	queryCtx.currentPiStream.end();
++	queryCtx.currentPiStream = null;
++	return true;
 +}
 +
  export function processAssistantMessage(message: SDKMessage, model: Model<any>, customToolNameToPi: Map<string, string>): void {
  	const c = ctx();
  	const assistantMsg = (message as any).message;
-@@ -1780,31 +1816,15 @@
+@@ -1780,31 +1820,15 @@
  		queryCtx.resetTurnState(model);
  		activeStreamIdleWatchdogs.get(queryCtx)?.refresh();
  		const allResults = extractAllToolResults(context);
@@ -113,37 +124,37 @@ diff -ruN '--exclude=node_modules' orig/src/index.ts patched/src/index.ts
 -			if (queryCtx.pendingToolCalls.size > 0 && queryCtx.pendingResults.size > 0) {
 -				debug(`BUG: both maps non-empty! handlers=${queryCtx.pendingToolCalls.size} results=${queryCtx.pendingResults.size}`);
 -			}
-+    debug(`provider: tool results, ${allResults.length} tail results, ${queryCtx.pendingToolCalls.size} waiting handlers, ctx.msgs=${context.messages.length}`);
-+    const { unmatchedResultIds, diagnostics } = deliverToolResults(
-+      queryCtx,
-+      allResults,
-+      context.messages as unknown as Array<{ role: string; content?: unknown; toolCallId?: string; isError?: boolean; [key: string]: unknown }>,
-+      (message) => debug(message),
-+    );
-+    if (diagnostics.presentButNotExtractedIds.length > 0 || diagnostics.missingFromContextIds.length > 0 || diagnostics.supplementalIds.length > 0 || diagnostics.skippedDuplicateIds.length > 0) {
-+      debug(`provider: tool result extraction diagnostics extracted=[${diagnostics.extractedIds.join(",")}] context=[${diagnostics.contextResultIds.join(",")}] waiting=[${diagnostics.waitingIds.join(",")}] present_not_extracted=[${diagnostics.presentButNotExtractedIds.join(",")}] missing_from_context=[${diagnostics.missingFromContextIds.join(",")}] supplemental=[${diagnostics.supplementalIds.join(",")}] skipped_duplicate=[${diagnostics.skippedDuplicateIds.join(",")}]`);
++		debug(`provider: tool results, ${allResults.length} tail results, ${queryCtx.pendingToolCalls.size} waiting handlers, ctx.msgs=${context.messages.length}`);
++		const { unmatchedResultIds, diagnostics } = deliverToolResults(
++			queryCtx,
++			allResults,
++			context.messages as unknown as Array<{ role: string; content?: unknown; toolCallId?: string; isError?: boolean; [key: string]: unknown }>,
++			(message) => debug(message),
++		);
++		if (diagnostics.presentButNotExtractedIds.length > 0 || diagnostics.missingFromContextIds.length > 0 || diagnostics.supplementalIds.length > 0 || diagnostics.skippedDuplicateIds.length > 0) {
++			debug(`provider: tool result extraction diagnostics extracted=[${diagnostics.extractedIds.join(",")}] context=[${diagnostics.contextResultIds.join(",")}] waiting=[${diagnostics.waitingIds.join(",")}] present_not_extracted=[${diagnostics.presentButNotExtractedIds.join(",")}] missing_from_context=[${diagnostics.missingFromContextIds.join(",")}] supplemental=[${diagnostics.supplementalIds.join(",")}] skipped_duplicate=[${diagnostics.skippedDuplicateIds.join(",")}]`);
  		}
  		if (unmatchedResultIds.length > 0) {
  			const errorResult: McpResult = {
-@@ -1815,7 +1835,13 @@
+@@ -1815,7 +1839,13 @@
  			queryCtx.pendingToolCalls.clear();
  			reportToolResultMismatch(queryCtx, "unmatched tool result", cwd);
  		}
-+    activeStreamIdleWatchdogs.get(queryCtx)?.refresh();
++		activeStreamIdleWatchdogs.get(queryCtx)?.refresh();
  		if (queryCtx.pendingToolCalls.size > 0) {
-+      if (flushUndeliveredToolCalls(queryCtx)) {
-+        if (sharedSession) sharedSession.cursor = context.messages.length;
-+        queryCtx.latestCursor = Math.max(queryCtx.latestCursor, context.messages.length);
-+        return stream;
-+      }
++			if (flushUndeliveredToolCalls(queryCtx)) {
++				if (sharedSession) sharedSession.cursor = context.messages.length;
++				queryCtx.latestCursor = Math.max(queryCtx.latestCursor, context.messages.length);
++				return stream;
++			}
  			debug(`WARNING: ${queryCtx.pendingToolCalls.size} MCP handlers still waiting after delivering ${allResults.length} results`);
  			piUI?.notify(`Claude bridge: ${queryCtx.pendingToolCalls.size} tool handler(s) still waiting — provider may be stuck`, "warning");
  		}
-@@ -2001,6 +2027,7 @@
+@@ -2001,6 +2031,7 @@
  				turnOutput: abortCtx.turnOutput,
  				turnSawStreamEvent: abortCtx.turnSawStreamEvent,
  				turnStarted: abortCtx.turnStarted,
-+        pendingToolCallCount: abortCtx.pendingToolCalls.size,
++				pendingToolCallCount: abortCtx.pendingToolCalls.size,
  			}),
  			onTimeout: ({ idleMs, timeoutMs }) => {
  				if (streamIdleTimedOut || wasAborted || options?.signal?.aborted || abortCtx.activeQuery !== sdkQuery) return;
@@ -154,7 +165,7 @@ diff -ruN '--exclude=node_modules' orig/src/query-state.ts patched/src/query-sta
  	pendingResults = new Map<string, McpResult>();
  	turnToolCallIds: string[] = [];
  	turnToolCalls: TurnToolCallRecord[] = [];
-+  undeliveredToolCalls: TurnToolCallRecord[] = [];
++	undeliveredToolCalls: TurnToolCallRecord[] = [];
  	claimedToolCallIds = new Set<string>();
  	deliveredToolResultIds = new Set<string>();
  	resolvedToolResultIds = new Set<string>();
@@ -162,7 +173,7 @@ diff -ruN '--exclude=node_modules' orig/src/query-state.ts patched/src/query-sta
  	resetToolTracking(): void {
  		this.turnToolCallIds = [];
  		this.turnToolCalls = [];
-+    this.undeliveredToolCalls = [];
++		this.undeliveredToolCalls = [];
  		this.claimedToolCallIds.clear();
  		this.deliveredToolResultIds.clear();
  		this.resolvedToolResultIds.clear();
@@ -170,24 +181,24 @@ diff -ruN '--exclude=node_modules' orig/src/query-state.ts patched/src/query-sta
  		if (!id) return;
  		const existing = this.turnToolCalls.find((call) => call.id === id);
  		if (existing) existing.arguments = args;
-+    const undelivered = this.undeliveredToolCalls.find((call) => call.id === id);
-+    if (undelivered) undelivered.arguments = args;
-+  }
++		const undelivered = this.undeliveredToolCalls.find((call) => call.id === id);
++		if (undelivered) undelivered.arguments = args;
++	}
 +
-+  markToolCallUndelivered(id: string | undefined): void {
-+    if (!id) return;
-+    const call = this.turnToolCalls.find((item) => item.id === id);
-+    if (!call || this.undeliveredToolCalls.some((item) => item.id === id)) return;
-+    this.undeliveredToolCalls.push({ ...call, arguments: { ...call.arguments } });
-+  }
++	markToolCallUndelivered(id: string | undefined): void {
++		if (!id) return;
++		const call = this.turnToolCalls.find((item) => item.id === id);
++		if (!call || this.undeliveredToolCalls.some((item) => item.id === id)) return;
++		this.undeliveredToolCalls.push({ ...call, arguments: { ...call.arguments } });
++	}
 +
-+  takeUndeliveredToolCalls(ids: Iterable<string>): TurnToolCallRecord[] {
-+    const idSet = new Set(ids);
-+    const selected = this.undeliveredToolCalls.filter((call) => idSet.has(call.id));
-+    if (selected.length === 0) return [];
-+    const selectedIds = new Set(selected.map((call) => call.id));
-+    this.undeliveredToolCalls = this.undeliveredToolCalls.filter((call) => !selectedIds.has(call.id));
-+    return selected.map((call) => ({ ...call, arguments: { ...call.arguments } }));
++	takeUndeliveredToolCalls(ids: Iterable<string>): TurnToolCallRecord[] {
++		const idSet = new Set(ids);
++		const selected = this.undeliveredToolCalls.filter((call) => idSet.has(call.id));
++		if (selected.length === 0) return [];
++		const selectedIds = new Set(selected.map((call) => call.id));
++		this.undeliveredToolCalls = this.undeliveredToolCalls.filter((call) => !selectedIds.has(call.id));
++		return selected.map((call) => ({ ...call, arguments: { ...call.arguments } }));
  	}
  
  	hasRecordedToolCall(id: string | undefined): boolean {
@@ -199,122 +210,122 @@ diff -ruN '--exclude=node_modules' orig/src/tool-result-delivery.ts patched/src/
 +import { toolResultToMcpContent, type McpResult } from "./extract-tool-results.js";
 +
 +export interface PiToolResultMessage {
-+  role: string;
-+  content?: unknown;
-+  toolCallId?: string;
-+  isError?: boolean;
-+  [key: string]: unknown;
++	role: string;
++	content?: unknown;
++	toolCallId?: string;
++	isError?: boolean;
++	[key: string]: unknown;
 +}
 +
 +export interface ToolResultDeliveryDiagnostics {
-+  extractedIds: string[];
-+  contextResultIds: string[];
-+  waitingIds: string[];
-+  missingFromContextIds: string[];
-+  presentButNotExtractedIds: string[];
-+  supplementalIds: string[];
-+  skippedDuplicateIds: string[];
++	extractedIds: string[];
++	contextResultIds: string[];
++	waitingIds: string[];
++	missingFromContextIds: string[];
++	presentButNotExtractedIds: string[];
++	supplementalIds: string[];
++	skippedDuplicateIds: string[];
 +}
 +
 +export interface ToolResultDeliveryOutcome {
-+  unmatchedResultIds: string[];
-+  diagnostics: ToolResultDeliveryDiagnostics;
++	unmatchedResultIds: string[];
++	diagnostics: ToolResultDeliveryDiagnostics;
 +}
 +
 +function unique(values: Iterable<string | undefined>): string[] {
-+  const out: string[] = [];
-+  const seen = new Set<string>();
-+  for (const value of values) {
-+    if (!value || seen.has(value)) continue;
-+    seen.add(value);
-+    out.push(value);
-+  }
-+  return out;
++	const out: string[] = [];
++	const seen = new Set<string>();
++	for (const value of values) {
++		if (!value || seen.has(value)) continue;
++		seen.add(value);
++		out.push(value);
++	}
++	return out;
 +}
 +
 +function collectContextToolResults(messages: PiToolResultMessage[]): McpResult[] {
-+  const results: McpResult[] = [];
-+  for (const msg of messages) {
-+    if (msg.role !== "toolResult") continue;
-+    results.push({
-+      content: toolResultToMcpContent(msg.content as string | Array<{ type: string; text?: string; data?: string; mimeType?: string }>),
-+      isError: msg.isError,
-+      toolCallId: msg.toolCallId,
-+    });
-+  }
-+  return results;
++	const results: McpResult[] = [];
++	for (const msg of messages) {
++		if (msg.role !== "toolResult") continue;
++		results.push({
++			content: toolResultToMcpContent(msg.content as string | Array<{ type: string; text?: string; data?: string; mimeType?: string }>),
++			isError: msg.isError,
++			toolCallId: msg.toolCallId,
++		});
++	}
++	return results;
 +}
 +
 +export function diagnoseToolResultExtraction(
-+  queryCtx: QueryContext,
-+  extractedResults: McpResult[],
-+  messages: PiToolResultMessage[],
++	queryCtx: QueryContext,
++	extractedResults: McpResult[],
++	messages: PiToolResultMessage[],
 +): ToolResultDeliveryDiagnostics {
-+  const extractedIds = unique(extractedResults.map((result) => result.toolCallId));
-+  const contextResults = collectContextToolResults(messages);
-+  const contextResultIds = unique(contextResults.map((result) => result.toolCallId));
-+  const waitingIds = unique(queryCtx.pendingToolCalls.keys());
-+  const contextIdSet = new Set(contextResultIds);
-+  const extractedIdSet = new Set(extractedIds);
-+  return {
-+    extractedIds,
-+    contextResultIds,
-+    waitingIds,
-+    missingFromContextIds: waitingIds.filter((id) => !contextIdSet.has(id)),
-+    presentButNotExtractedIds: waitingIds.filter((id) => contextIdSet.has(id) && !extractedIdSet.has(id)),
-+    supplementalIds: [],
-+    skippedDuplicateIds: [],
-+  };
++	const extractedIds = unique(extractedResults.map((result) => result.toolCallId));
++	const contextResults = collectContextToolResults(messages);
++	const contextResultIds = unique(contextResults.map((result) => result.toolCallId));
++	const waitingIds = unique(queryCtx.pendingToolCalls.keys());
++	const contextIdSet = new Set(contextResultIds);
++	const extractedIdSet = new Set(extractedIds);
++	return {
++		extractedIds,
++		contextResultIds,
++		waitingIds,
++		missingFromContextIds: waitingIds.filter((id) => !contextIdSet.has(id)),
++		presentButNotExtractedIds: waitingIds.filter((id) => contextIdSet.has(id) && !extractedIdSet.has(id)),
++		supplementalIds: [],
++		skippedDuplicateIds: [],
++	};
 +}
 +
 +export function deliverToolResults(
-+  queryCtx: QueryContext,
-+  extractedResults: McpResult[],
-+  messages: PiToolResultMessage[],
-+  log: (message: string) => void = () => {},
++	queryCtx: QueryContext,
++	extractedResults: McpResult[],
++	messages: PiToolResultMessage[],
++	log: (message: string) => void = () => {},
 +): ToolResultDeliveryOutcome {
-+  const diagnostics = diagnoseToolResultExtraction(queryCtx, extractedResults, messages);
-+  const results: McpResult[] = [...extractedResults];
-+  const resultIds = new Set(unique(results.map((result) => result.toolCallId)));
-+  const contextResults = collectContextToolResults(messages);
-+  for (const result of contextResults) {
-+    const id = result.toolCallId;
-+    if (!id || resultIds.has(id)) continue;
-+    if (!queryCtx.hasRecordedToolCall(id)) continue;
-+    if (!queryCtx.pendingToolCalls.has(id) && queryCtx.toolResultProgress().deliveredIds.includes(id)) continue;
-+    results.push(result);
-+    resultIds.add(id);
-+    diagnostics.supplementalIds.push(id);
-+  }
++	const diagnostics = diagnoseToolResultExtraction(queryCtx, extractedResults, messages);
++	const results: McpResult[] = [...extractedResults];
++	const resultIds = new Set(unique(results.map((result) => result.toolCallId)));
++	const contextResults = collectContextToolResults(messages);
++	for (const result of contextResults) {
++		const id = result.toolCallId;
++		if (!id || resultIds.has(id)) continue;
++		if (!queryCtx.hasRecordedToolCall(id)) continue;
++		if (!queryCtx.pendingToolCalls.has(id) && queryCtx.toolResultProgress().deliveredIds.includes(id)) continue;
++		results.push(result);
++		resultIds.add(id);
++		diagnostics.supplementalIds.push(id);
++	}
 +
-+  const unmatchedResultIds: string[] = [];
-+  for (const result of results) {
-+    const id = result.toolCallId;
-+    if (id && !queryCtx.hasRecordedToolCall(id)) {
-+      queryCtx.markToolResultUnmatched(id);
-+      unmatchedResultIds.push(id);
-+      log(`ERROR: tool result [${id}] has no registered tool_call id; refusing to queue or deliver`);
-+      continue;
-+    }
-+    if (id && !queryCtx.pendingToolCalls.has(id) && queryCtx.toolResultProgress().resolvedIds.includes(id)) {
-+      diagnostics.skippedDuplicateIds.push(id);
-+      log(`provider: skipping duplicate already-resolved tool result [${id}]`);
-+      continue;
-+    }
-+    queryCtx.markToolResultDelivered(id);
-+    if (id && queryCtx.pendingToolCalls.has(id)) {
-+      const pending = queryCtx.pendingToolCalls.get(id)!;
-+      queryCtx.pendingToolCalls.delete(id);
-+      log(`provider: resolving ${pending.toolName} [${id}]${result.isError ? " (error)" : ""}`);
-+      pending.resolve(result);
-+    } else if (id) {
-+      if (!queryCtx.pendingResults.has(id)) queryCtx.pendingResults.set(id, result);
-+      log(`provider: queued result [${id}] (${queryCtx.pendingResults.size} pending)`);
-+    } else {
-+      log("WARNING: tool result without toolCallId, cannot match");
-+    }
-+  }
-+  return { unmatchedResultIds, diagnostics };
++	const unmatchedResultIds: string[] = [];
++	for (const result of results) {
++		const id = result.toolCallId;
++		if (id && !queryCtx.hasRecordedToolCall(id)) {
++			queryCtx.markToolResultUnmatched(id);
++			unmatchedResultIds.push(id);
++			log(`ERROR: tool result [${id}] has no registered tool_call id; refusing to queue or deliver`);
++			continue;
++		}
++		if (id && !queryCtx.pendingToolCalls.has(id) && queryCtx.toolResultProgress().resolvedIds.includes(id)) {
++			diagnostics.skippedDuplicateIds.push(id);
++			log(`provider: skipping duplicate already-resolved tool result [${id}]`);
++			continue;
++		}
++		queryCtx.markToolResultDelivered(id);
++		if (id && queryCtx.pendingToolCalls.has(id)) {
++			const pending = queryCtx.pendingToolCalls.get(id)!;
++			queryCtx.pendingToolCalls.delete(id);
++			log(`provider: resolving ${pending.toolName} [${id}]${result.isError ? " (error)" : ""}`);
++			pending.resolve(result);
++		} else if (id) {
++			if (!queryCtx.pendingResults.has(id)) queryCtx.pendingResults.set(id, result);
++			log(`provider: queued result [${id}] (${queryCtx.pendingResults.size} pending)`);
++		} else {
++			log("WARNING: tool result without toolCallId, cannot match");
++		}
++	}
++	return { unmatchedResultIds, diagnostics };
 +}
 diff -ruN '--exclude=node_modules' orig/tests/unit-import.mjs patched/tests/unit-import.mjs
 --- orig/tests/unit-import.mjs	2026-06-29 09:53:34.060051293 +0800
@@ -323,29 +334,29 @@ diff -ruN '--exclude=node_modules' orig/tests/unit-import.mjs patched/tests/unit
  		assert.deepEqual(findUnpairedToolUses(result), []);
  	});
  
-+  it("interleaved Pi user text is held until all parallel tool results are adjacent", () => {
-+    const msgs = [
-+      { role: "user", content: "run both tools" },
-+      { role: "assistant", content: [
-+        { type: "text", text: "I will call both tools." },
-+        { type: "toolCall", id: "call:one", name: "read", arguments: { path: "one.txt" } },
-+        { type: "toolCall", id: "call:two", name: "bash", arguments: { command: "pwd" } },
-+      ] },
-+      { role: "toolResult", toolCallId: "call:one", content: "one" },
-+      { role: "user", content: "Pi follow-up between results" },
-+      { role: "toolResult", toolCallId: "call:two", content: "two" },
-+      { role: "assistant", content: [{ type: "text", text: "done" }] },
-+    ];
++	it("interleaved Pi user text is held until all parallel tool results are adjacent", () => {
++		const msgs = [
++			{ role: "user", content: "run both tools" },
++			{ role: "assistant", content: [
++				{ type: "text", text: "I will call both tools." },
++				{ type: "toolCall", id: "call:one", name: "read", arguments: { path: "one.txt" } },
++				{ type: "toolCall", id: "call:two", name: "bash", arguments: { command: "pwd" } },
++			] },
++			{ role: "toolResult", toolCallId: "call:one", content: "one" },
++			{ role: "user", content: "Pi follow-up between results" },
++			{ role: "toolResult", toolCallId: "call:two", content: "two" },
++			{ role: "assistant", content: [{ type: "text", text: "done" }] },
++		];
 +
-+    const result = convert(msgs);
-+    assert.equal(result.length, 5);
-+    assert.equal(result[1].role, "assistant");
-+    assert.deepEqual(result[2].content.map((block) => block.tool_use_id), ["call_one", "call_two"]);
-+    assert.equal(result[3].role, "user");
-+    assert.equal(result[3].content, "Pi follow-up between results");
-+    assert.equal(result[4].role, "assistant");
-+    assert.deepEqual(findUnpairedToolUses(result), []);
-+  });
++		const result = convert(msgs);
++		assert.equal(result.length, 5);
++		assert.equal(result[1].role, "assistant");
++		assert.deepEqual(result[2].content.map((block) => block.tool_use_id), ["call_one", "call_two"]);
++		assert.equal(result[3].role, "user");
++		assert.equal(result[3].content, "Pi follow-up between results");
++		assert.equal(result[4].role, "assistant");
++		assert.deepEqual(findUnpairedToolUses(result), []);
++	});
 +
  	it("mixed conversation: user → assistant(tool) → toolResult → assistant(text)", () => {
  		const msgs = [
@@ -357,31 +368,31 @@ diff -ruN '--exclude=node_modules' orig/tests/unit-querycontext.mjs patched/test
  
  	it("resetToolTracking clears tool-call matching state for a new assistant message", () => {
  		ctx().recordToolCall("id1", "read", { path: "a" });
-+    ctx().markToolCallUndelivered("id1");
++		ctx().markToolCallUndelivered("id1");
  		ctx().markToolResultDelivered("id1");
  		ctx().markToolResultResolved("id1");
  		ctx().resetToolTracking();
  
  		assert.deepStrictEqual(ctx().turnToolCallIds, []);
  		assert.deepStrictEqual(ctx().turnToolCalls, []);
-+    assert.deepStrictEqual(ctx().undeliveredToolCalls, []);
++		assert.deepStrictEqual(ctx().undeliveredToolCalls, []);
  		assert.strictEqual(ctx().deliveredToolResultIds.size, 0);
  		assert.strictEqual(ctx().resolvedToolResultIds.size, 0);
  	});
  
-+  it("tracks assistant tool calls that were recorded while no Pi stream was available", () => {
-+    ctx().recordToolCall("shown", "mcp", { tool: "first" });
-+    ctx().recordToolCall("hidden", "bash", { command: "pwd" });
-+    ctx().markToolCallUndelivered("hidden");
-+    ctx().pendingToolCalls.set("hidden", { toolName: "bash", resolve: () => {} });
++	it("tracks assistant tool calls that were recorded while no Pi stream was available", () => {
++		ctx().recordToolCall("shown", "mcp", { tool: "first" });
++		ctx().recordToolCall("hidden", "bash", { command: "pwd" });
++		ctx().markToolCallUndelivered("hidden");
++		ctx().pendingToolCalls.set("hidden", { toolName: "bash", resolve: () => {} });
 +
-+    const selected = ctx().takeUndeliveredToolCalls(ctx().pendingToolCalls.keys());
-+    assert.deepStrictEqual(selected, [{ id: "hidden", toolName: "bash", arguments: { command: "pwd" } }]);
-+    assert.deepStrictEqual(ctx().undeliveredToolCalls, []);
++		const selected = ctx().takeUndeliveredToolCalls(ctx().pendingToolCalls.keys());
++		assert.deepStrictEqual(selected, [{ id: "hidden", toolName: "bash", arguments: { command: "pwd" } }]);
++		assert.deepStrictEqual(ctx().undeliveredToolCalls, []);
 +
-+    const again = ctx().takeUndeliveredToolCalls(["hidden"]);
-+    assert.deepStrictEqual(again, []);
-+  });
++		const again = ctx().takeUndeliveredToolCalls(["hidden"]);
++		assert.deepStrictEqual(again, []);
++	});
 +
  	it("claimToolCall matches handler invocation by tool name and args, not stream position", () => {
  		ctx().recordToolCall("call-read", "read", { path: "a.txt" });
@@ -393,41 +404,41 @@ diff -ruN '--exclude=node_modules' orig/tests/unit-rate-limit.mjs patched/tests/
  		assert.equal(watchdog.timedOut(), true);
  	});
  
-+  it("does not fire while MCP tool handlers are pending", () => {
-+    let now = 0;
-+    let timer;
-+    const state = {
-+      activeQuery: {},
-+      currentPiStream: {},
-+      turnOutput: { timestamp: 0 },
-+      turnSawStreamEvent: false,
-+      turnStarted: false,
-+      pendingToolCallCount: 1,
-+    };
-+    const timeouts = [];
-+    const watchdog = createStreamIdleWatchdog({
-+      clearTimer: (handle) => { handle.cancelled = true; },
-+      getState: () => state,
-+      now: () => now,
-+      onTimeout: (info) => timeouts.push(info),
-+      setTimer: (fn, delayMs) => {
-+        timer = { cancelled: false, delayMs, fn };
-+        return timer;
-+      },
-+      timeoutMs: 1_000,
-+    });
++	it("does not fire while MCP tool handlers are pending", () => {
++		let now = 0;
++		let timer;
++		const state = {
++			activeQuery: {},
++			currentPiStream: {},
++			turnOutput: { timestamp: 0 },
++			turnSawStreamEvent: false,
++			turnStarted: false,
++			pendingToolCallCount: 1,
++		};
++		const timeouts = [];
++		const watchdog = createStreamIdleWatchdog({
++			clearTimer: (handle) => { handle.cancelled = true; },
++			getState: () => state,
++			now: () => now,
++			onTimeout: (info) => timeouts.push(info),
++			setTimer: (fn, delayMs) => {
++				timer = { cancelled: false, delayMs, fn };
++				return timer;
++			},
++			timeoutMs: 1_000,
++		});
 +
-+    watchdog.refresh();
-+    assert.equal(timer, undefined);
-+    now = 5_000;
-+    watchdog.refresh();
-+    assert.equal(timeouts.length, 0);
-+    assert.equal(watchdog.timedOut(), false);
++		watchdog.refresh();
++		assert.equal(timer, undefined);
++		now = 5_000;
++		watchdog.refresh();
++		assert.equal(timeouts.length, 0);
++		assert.equal(watchdog.timedOut(), false);
 +
-+    state.pendingToolCallCount = 0;
-+    watchdog.refresh();
-+    assert.deepEqual(timeouts, [{ idleMs: 5_000, timeoutMs: 1_000 }]);
-+  });
++		state.pendingToolCallCount = 0;
++		watchdog.refresh();
++		assert.deepEqual(timeouts, [{ idleMs: 5_000, timeoutMs: 1_000 }]);
++	});
 +
  	it("does not fire after visible stream output starts", () => {
  		let now = 0;
@@ -444,94 +455,94 @@ diff -ruN '--exclude=node_modules' orig/tests/unit-tool-result-delivery.mjs patc
 +import { deliverToolResults } from "../src/tool-result-delivery.js";
 +
 +function pending(ctx, id, toolName, resolved) {
-+  ctx.pendingToolCalls.set(id, {
-+    toolName,
-+    resolve: (result) => {
-+      ctx.markToolResultResolved(id);
-+      resolved.push({ id, result });
-+    },
-+  });
++	ctx.pendingToolCalls.set(id, {
++		toolName,
++		resolve: (result) => {
++			ctx.markToolResultResolved(id);
++			resolved.push({ id, result });
++		},
++	});
 +}
 +
 +function text(result) {
-+  return result.content.map((block) => block.type === "text" ? block.text : "[image]").join("\n");
++	return result.content.map((block) => block.type === "text" ? block.text : "[image]").join("\n");
 +}
 +
 +describe("active query tool-result delivery", () => {
-+  it("supplements waiting results that are present in Pi history but missed by tail extraction", () => {
-+    const ctx = new QueryContext();
-+    const resolved = [];
-+    ctx.recordToolCall("call:one", "read", { path: "one.txt" });
-+    ctx.recordToolCall("call:two", "bash", { command: "pwd" });
-+    pending(ctx, "call:one", "read", resolved);
-+    pending(ctx, "call:two", "bash", resolved);
++	it("supplements waiting results that are present in Pi history but missed by tail extraction", () => {
++		const ctx = new QueryContext();
++		const resolved = [];
++		ctx.recordToolCall("call:one", "read", { path: "one.txt" });
++		ctx.recordToolCall("call:two", "bash", { command: "pwd" });
++		pending(ctx, "call:one", "read", resolved);
++		pending(ctx, "call:two", "bash", resolved);
 +
-+    const extracted = [{ toolCallId: "call:one", content: [{ type: "text", text: "one" }] }];
-+    const messages = [
-+      { role: "user", content: "run both" },
-+      { role: "assistant", content: [{ type: "toolCall", id: "call:one", name: "read" }, { type: "toolCall", id: "call:two", name: "bash" }] },
-+      { role: "toolResult", toolCallId: "call:one", content: "one" },
-+      { role: "assistant", content: [{ type: "text", text: "boundary emitted by host" }] },
-+      { role: "toolResult", toolCallId: "call:two", content: "two" },
-+      { role: "user", content: "interleaved steer" },
-+    ];
++		const extracted = [{ toolCallId: "call:one", content: [{ type: "text", text: "one" }] }];
++		const messages = [
++			{ role: "user", content: "run both" },
++			{ role: "assistant", content: [{ type: "toolCall", id: "call:one", name: "read" }, { type: "toolCall", id: "call:two", name: "bash" }] },
++			{ role: "toolResult", toolCallId: "call:one", content: "one" },
++			{ role: "assistant", content: [{ type: "text", text: "boundary emitted by host" }] },
++			{ role: "toolResult", toolCallId: "call:two", content: "two" },
++			{ role: "user", content: "interleaved steer" },
++		];
 +
-+    const outcome = deliverToolResults(ctx, extracted, messages);
-+    assert.deepEqual(outcome.unmatchedResultIds, []);
-+    assert.deepEqual(outcome.diagnostics.presentButNotExtractedIds, ["call:two"]);
-+    assert.deepEqual(outcome.diagnostics.supplementalIds, ["call:two"]);
-+    assert.deepEqual(resolved.map((item) => item.id), ["call:one", "call:two"]);
-+    assert.deepEqual(resolved.map((item) => text(item.result)), ["one", "two"]);
-+    assert.equal(ctx.pendingToolCalls.size, 0);
-+    assert.equal(ctx.pendingResults.size, 0);
-+    assert.deepEqual(ctx.toolResultProgress().unresolvedIds, []);
-+  });
++		const outcome = deliverToolResults(ctx, extracted, messages);
++		assert.deepEqual(outcome.unmatchedResultIds, []);
++		assert.deepEqual(outcome.diagnostics.presentButNotExtractedIds, ["call:two"]);
++		assert.deepEqual(outcome.diagnostics.supplementalIds, ["call:two"]);
++		assert.deepEqual(resolved.map((item) => item.id), ["call:one", "call:two"]);
++		assert.deepEqual(resolved.map((item) => text(item.result)), ["one", "two"]);
++		assert.equal(ctx.pendingToolCalls.size, 0);
++		assert.equal(ctx.pendingResults.size, 0);
++		assert.deepEqual(ctx.toolResultProgress().unresolvedIds, []);
++	});
 +
-+  it("does not requeue already-resolved duplicate results from separate callbacks", () => {
-+    const ctx = new QueryContext();
-+    const resolved = [];
-+    ctx.recordToolCall("call:one", "read", { path: "one.txt" });
-+    ctx.recordToolCall("call:two", "bash", { command: "pwd" });
-+    pending(ctx, "call:one", "read", resolved);
-+    pending(ctx, "call:two", "bash", resolved);
++	it("does not requeue already-resolved duplicate results from separate callbacks", () => {
++		const ctx = new QueryContext();
++		const resolved = [];
++		ctx.recordToolCall("call:one", "read", { path: "one.txt" });
++		ctx.recordToolCall("call:two", "bash", { command: "pwd" });
++		pending(ctx, "call:one", "read", resolved);
++		pending(ctx, "call:two", "bash", resolved);
 +
-+    deliverToolResults(ctx, [{ toolCallId: "call:one", content: [{ type: "text", text: "one" }] }], [
-+      { role: "assistant", content: [{ type: "toolCall", id: "call:one", name: "read" }, { type: "toolCall", id: "call:two", name: "bash" }] },
-+      { role: "toolResult", toolCallId: "call:one", content: "one" },
-+    ]);
-+    assert.deepEqual(resolved.map((item) => item.id), ["call:one"]);
++		deliverToolResults(ctx, [{ toolCallId: "call:one", content: [{ type: "text", text: "one" }] }], [
++			{ role: "assistant", content: [{ type: "toolCall", id: "call:one", name: "read" }, { type: "toolCall", id: "call:two", name: "bash" }] },
++			{ role: "toolResult", toolCallId: "call:one", content: "one" },
++		]);
++		assert.deepEqual(resolved.map((item) => item.id), ["call:one"]);
 +
-+    const outcome = deliverToolResults(ctx, [
-+      { toolCallId: "call:one", content: [{ type: "text", text: "one again" }] },
-+      { toolCallId: "call:two", content: [{ type: "text", text: "two" }] },
-+    ], [
-+      { role: "assistant", content: [{ type: "toolCall", id: "call:one", name: "read" }, { type: "toolCall", id: "call:two", name: "bash" }] },
-+      { role: "toolResult", toolCallId: "call:one", content: "one" },
-+      { role: "user", content: "between callbacks" },
-+      { role: "toolResult", toolCallId: "call:two", content: "two" },
-+    ]);
++		const outcome = deliverToolResults(ctx, [
++			{ toolCallId: "call:one", content: [{ type: "text", text: "one again" }] },
++			{ toolCallId: "call:two", content: [{ type: "text", text: "two" }] },
++		], [
++			{ role: "assistant", content: [{ type: "toolCall", id: "call:one", name: "read" }, { type: "toolCall", id: "call:two", name: "bash" }] },
++			{ role: "toolResult", toolCallId: "call:one", content: "one" },
++			{ role: "user", content: "between callbacks" },
++			{ role: "toolResult", toolCallId: "call:two", content: "two" },
++		]);
 +
-+    assert.deepEqual(outcome.unmatchedResultIds, []);
-+    assert.deepEqual(outcome.diagnostics.skippedDuplicateIds, ["call:one"]);
-+    assert.deepEqual(resolved.map((item) => item.id), ["call:one", "call:two"]);
-+    assert.equal(ctx.pendingToolCalls.size, 0);
-+    assert.equal(ctx.pendingResults.size, 0);
-+  });
++		assert.deepEqual(outcome.unmatchedResultIds, []);
++		assert.deepEqual(outcome.diagnostics.skippedDuplicateIds, ["call:one"]);
++		assert.deepEqual(resolved.map((item) => item.id), ["call:one", "call:two"]);
++		assert.equal(ctx.pendingToolCalls.size, 0);
++		assert.equal(ctx.pendingResults.size, 0);
++	});
 +
-+  it("preserves hard failure behavior for unmatched result ids", () => {
-+    const ctx = new QueryContext();
-+    const resolved = [];
-+    ctx.recordToolCall("call:one", "read", {});
-+    pending(ctx, "call:one", "read", resolved);
++	it("preserves hard failure behavior for unmatched result ids", () => {
++		const ctx = new QueryContext();
++		const resolved = [];
++		ctx.recordToolCall("call:one", "read", {});
++		pending(ctx, "call:one", "read", resolved);
 +
-+    const outcome = deliverToolResults(ctx, [{ toolCallId: "call:rogue", content: [{ type: "text", text: "rogue" }] }], [
-+      { role: "assistant", content: [{ type: "toolCall", id: "call:one", name: "read" }] },
-+      { role: "toolResult", toolCallId: "call:rogue", content: "rogue" },
-+    ]);
++		const outcome = deliverToolResults(ctx, [{ toolCallId: "call:rogue", content: [{ type: "text", text: "rogue" }] }], [
++			{ role: "assistant", content: [{ type: "toolCall", id: "call:one", name: "read" }] },
++			{ role: "toolResult", toolCallId: "call:rogue", content: "rogue" },
++		]);
 +
-+    assert.deepEqual(outcome.unmatchedResultIds, ["call:rogue"]);
-+    assert.deepEqual(ctx.toolResultProgress().unmatchedResultIds, ["call:rogue"]);
-+    assert.equal(ctx.pendingToolCalls.size, 1);
-+    assert.deepEqual(resolved, []);
-+  });
++		assert.deepEqual(outcome.unmatchedResultIds, ["call:rogue"]);
++		assert.deepEqual(ctx.toolResultProgress().unmatchedResultIds, ["call:rogue"]);
++		assert.equal(ctx.pendingToolCalls.size, 1);
++		assert.deepEqual(resolved, []);
++	});
 +});

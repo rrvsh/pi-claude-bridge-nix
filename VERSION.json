@@ -1,8 +1,8 @@
 {
-  "version": "1.5.0",
-  "rev": "d70c86ff9302ddecb7e2ae9d833bacb0544d6ecd",
-  "srcHash": "sha256-VmGea5gTfD3KgkX6/nongGVcRwM96uSmLKq0RxeL0zY=",
-  "npmDepsHash": "sha256-Mcr6n1SgVoN+XiI+sArROnUmkGN9soaWtPRFCA4LjY4=",
+  "version": "2.0.0",
+  "rev": "eeaf4feb35ceef61fcb2b850ba8d7387a528829e",
+  "srcHash": "sha256-ira3oTs7RT70yaytTy6ilvUnYMesf5qJL33xTNq7yH8=",
+  "npmDepsHash": "sha256-gv2Md+v6Uzr9vD2KznEpNB8cyC/wSF6BBcgHp0dr6NA=",
   "sourceRoot": "pi-extensions/pi-claude-bridge",
   "lockfileSource": "upstream subdirectory package-lock.json"
 }
